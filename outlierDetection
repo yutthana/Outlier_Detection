@@ -1,0 +1,238 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jan 16 16:04:42 2017
+
+@author: Yutthana
+"""
+
+import os, os.path
+import numpy as np
+import pandas as pd
+import re
+import time
+import scipy
+import cvxpy as cvx
+import math
+
+total_time = time.clock()
+
+# generate sample based on mean vector and cov matrix
+# df: dataframe, pos: position
+# return: set of K-1 sampling
+def GenerateSampling(df, pos):
+    time_start = time.clock()
+    mean_vec = df.iloc[pos]  #x0 as mean vector
+    cov_mat = df - mean_vec
+    cov_mat.drop(cov_mat.index[[pos]], inplace=True)
+    n = len(df.columns)
+    cov_mat = np.dot(cov_mat.transpose(), cov_mat) / (n - 1) #find covariance matrix from K neigbor
+
+    # generate k-1 samplings (non-negative)
+    sampling = np.rint(np.abs(scipy.random.multivariate_normal(mean_vec, cov_mat, len(df.index) - 2)))
+    time_elapsed = (time.clock() - time_start)
+    print 'Generating Sample Time'
+    print time_elapsed
+    return sampling
+
+
+# find S
+# A: matrix n*n
+# return: matrix S
+def FindS(A):
+    time_start = time.clock()
+    L = np.zeros((len(A), len(A)), float)
+    for i in range(len(A)):
+        for j in range(len(A)):
+            if i == j and L[i,j] == 0:
+                deg_i = sum(A[i])
+                # value = 1 - (A[i, j] / float(deg_i))
+                value = 1 - (A[i, j] / float(deg_i))
+                L[i, j] = value
+                L[j, i] = value
+            elif A[i, j] == 1 and i != j and L[i,j] == 0:
+                deg_i = sum(A[i])
+                deg_j = sum(A[j])
+                # value = -1 / math.sqrt(deg_i * deg_j)
+                value = -1 / math.sqrt(deg_i * deg_j)
+                L[i, j] = value
+                L[j, i] = value
+
+    eigvalue, eigvec = scipy.linalg.eigh(L)
+
+
+    eigvalue[eigvalue < 10e-12] = 0.01 # for some numerical instability
+    # eigvalue[eigvalue < 0] *= -1  # for some numerical instability
+    square_eig = np.sqrt(eigvalue)
+    diag_eig = np.diag(square_eig)
+
+    S = np.dot(diag_eig, eigvec.T)  # S = (eigenVal)^1/2 * eigenvector.T
+
+    time_elapsed = (time.clock() - time_start)
+    print 'Generating S Matrix'
+    print time_elapsed
+    return S, L
+
+
+time_start = time.clock()
+
+sub_dir = 'C:/Users/Yutthana/Desktop/faces/nodepixel/sim'
+
+data_list = []
+Edges = []
+filename = []
+# read file
+for f in os.listdir(sub_dir):
+    with open(os.path.join(sub_dir, f)) as readfile:
+        if 'Edge' in f: #get edge information (filename with edge)
+            for i in readfile.readlines():
+                tup = i.split('\t')
+                Edges.append((int(tup[0]), int(tup[1])))
+        else: #pixel information (all other files)
+            filename.append(f)
+            line = readfile.readlines()
+            list_val = []
+            for val in line:
+                test = re.split(r'\t+', val)[1][:-1]
+                list_val.append(test)
+            int_val = map(float, list_val)
+            data_list.append(int_val)
+
+# getting dataframe
+df = pd.DataFrame(data_list)
+
+time_elapsed = (time.clock() - time_start)
+print "Generating DataFrame"
+print time_elapsed
+
+# --------------------------- network topology ------------------------
+# find A and S Matrix
+n = len(df.columns)
+A = np.zeros((n, n), int)
+for tup in Edges:
+    A[tup] = 1
+
+#S = eigenvalue(L)^1/2 * eigenvector
+S, L = FindS(A)
+# ----------------------------------------------------------------------
+
+# generate Z*one.T
+z = np.ones(len(df)-1)
+z = np.asmatrix(z)
+z = np.concatenate([z, -z],axis=1)
+one = np.ones((len(df.columns)))
+one = np.asmatrix(one)
+ZOne = np.dot(z.T, one)
+
+
+
+# it = 0
+##### for-loop to test with whole set of networks (k = 9) #####
+for it in range(len(df)):
+    index_list = list(df.T)
+    index_list[0], index_list[it] = index_list[it], index_list[0] #reindex (swap row of data)
+    df.index = index_list
+    df.sort_index(inplace=True)
+
+
+    # generate sampling (for potential outlier pic)
+    sampling = GenerateSampling(df, 0)
+
+    # append sampling
+    column_reindex = [((len(df)-1) * 2) - 1] #new index
+    for i in range(((len(df) - 1) * 2) - 1):
+        column_reindex.append(i)
+    df2 = pd.concat([df, pd.DataFrame(sampling)])
+    df2.index = column_reindex
+    df2.sort_index(inplace=True) #reindex
+    df2 = df2.as_matrix()
+
+    X1 = np.subtract(df2,ZOne) # X1 = X0 - Z*1.T
+    X2 = np.add(df2, ZOne) # X2 = X0 + z*1.T
+
+
+    lambda1 = np.sqrt(0.1)
+
+    #divide X1 and X2 with S
+    S_inv = np.linalg.inv(S * lambda1)
+    X1 = np.dot(X1, S_inv)
+    X2 = np.dot(X2, S_inv)
+    X = np.concatenate([X1, -X2], axis=1)
+
+
+    # -------------------------- optimizing problem -------------------------
+    optimizing_start = time.clock()
+    lambda2 = 0.01
+
+    # create varaible w; size = 2n * 1 = 7680 * 1
+    w = cvx.Variable(X.shape[1])
+    mid_point = X.shape[1]/2
+    cvx.pos(w[0:mid_point]) # pos = max(x, 0)
+    cvx.neg(w[mid_point:X.shape[1]]) # neg = max(-x, 0)
+
+    P = X.T.dot(X)
+    # quad_form = (w.T)P(w)
+    objective = cvx.quad_form(w, P) #objective = w.T * X.T * X * w
+
+    #a is diaganal 1 matrix
+    a = np.zeros((X.shape[1], X.shape[1]), int)
+    np.fill_diagonal(a, 1)
+
+    #l2 = w.T*w
+    # l2 = cvx.quad_form(w, a)
+    l2 = cvx.norm2(w)
+
+    prob = cvx.Problem(cvx.Minimize(objective + lambda2*l2), [cvx.sum_entries(w) == 1, w >= 0])
+
+
+    prob.solve(solver=cvx.SCS)
+    print "status:", prob.status
+    # ------------------------------------------------------------------------------------
+
+    ##### abnormal nodeid: 0,1,2,10,11,12,20,21,22 #####
+
+    #count number of non-zero
+    count = 0
+
+    #lsit of non-zero index
+    nonzero = []
+
+    epsilon = 10e-8 #instead of 0
+
+    # lsit of outlier node
+    out_list = [25,26,27,35,36,37,45,46,47]
+
+    # find non zero entry
+    for i in range(mid_point):
+        w1 = w[i].value #w+
+        w2 = w[i + mid_point].value #w-
+        if w1 < epsilon: #numerical instability
+            w1 = 0
+        if w2 < epsilon: #numerical instability
+            w2 = 0
+        w_op = w1 - w2
+        w_op2 = w2 - w1
+
+
+        if w_op >= epsilon or w_op2 >= epsilon:
+            nonzero.append(i)
+            count += 1
+
+
+    #print number of non-zero entry
+    print str(filename[it]) + ' :number of non-zero entry:' + str(count)
+
+    for i in nonzero:
+        print i
+
+
+    optimizing_end = (time.clock() - optimizing_start)
+    print "Optimizing step"
+    print optimizing_end
+
+
+end_time = (time.clock() - total_time)
+print 'Total time'
+print end_time
+
+
+
